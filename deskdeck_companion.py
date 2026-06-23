@@ -3,6 +3,7 @@ import time
 import ctypes
 import subprocess
 import serial
+import serial.tools.list_ports  # Added to handle automatic port scanning
 import requests
 import psutil
 from ctypes import cast, POINTER
@@ -16,7 +17,6 @@ except Exception:
     GPUtil = None
 
 # ----------------------- CONFIG -----------------------
-COM_PORT     = "COM5"            # The OUTGOING Bluetooth SPP port for DeskDeck
 BAUD         = 115200
 VLC_PORT     = 8080
 VLC_PASSWORD = "vlc"             # The Lua HTTP password configured in VLC
@@ -31,15 +31,31 @@ LAUNCHERS = [                    # (Label shown on device, absolute path or URL)
 # Virtual-key codes for system media keys
 VK = {"playpause": 0xB3, "next": 0xB0, "prev": 0xB1, "mute": 0xAD}
 
+# ----------------------- AUTOMATIC PORT FINDER -----------------------
+def auto_find_com_port():
+    """Scans Windows for any active Bluetooth serial ports."""
+    ports = serial.tools.list_ports.comports()
+    bluetooth_ports = []
+    
+    for port in ports:
+        # Windows tags Bluetooth virtual serial ports with 'BTHENUM' or 'Bluetooth' in the hardware ID
+        if "BTHENUM" in port.hwid or "Bluetooth" in port.description:
+            bluetooth_ports.append(port.device)
+            
+    if not bluetooth_ports:
+        return None
+        
+    # Standard logic: Windows usually assigns the Outgoing port as the lower number, 
+    # or the first one created. We return the first discovered Bluetooth port.
+    return bluetooth_ports[0]
+
 # ----------------------- AUDIO MANAGEMENT -----------------------
 def master_endpoint():
     try:
         spk = AudioUtilities.GetSpeakers()
-        # Fallback structure for older legacy pycaw builds
         if hasattr(spk, 'Activate'):
             iface = spk.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
             return cast(iface, POINTER(IAudioEndpointVolume))
-        # Direct property pull for modern pycaw versions
         else:
             return spk.EndpointVolume
     except Exception as e:
@@ -185,11 +201,11 @@ def push_state(ser, handles):
     gpu, temp = gpu_stats()
     s = f"cpu={int(psutil.cpu_percent())};ram={int(psutil.virtual_memory().percent)};gpu={gpu};temp={temp};net={net_mbs():.1f}"
     ser.write(("S|" + s + "\n").encode())
-    ser.flush()  # Fixed comment syntax here
+    ser.flush()  
 
 def push_launchers(ser):
     ser.write(("L|" + ";".join(l[0] for l in LAUNCHERS) + "\n").encode())
-    ser.flush()  # Fixed comment syntax here
+    ser.flush()  
 
 # ----------------------- TELEMETRY ROUTER -----------------------
 def handle(line, ser, handles):
@@ -222,17 +238,26 @@ def handle(line, ser, handles):
 # ----------------------- WORKER THREAD MAIN -----------------------
 def run():
     comtypes.CoInitialize() 
-    
     handles = []
+    
     while True:
+        # Dynamically search for the Bluetooth port on every loop execution
+        target_port = auto_find_com_port()
+        
+        if not target_port:
+            print("Searching for an active Bluetooth DeskDeck link on your PC...")
+            time.sleep(3)
+            continue
+            
         try:
-            ser = serial.Serial(COM_PORT, BAUD, timeout=0.05)
+            ser = serial.Serial(target_port, BAUD, timeout=0.05)
         except Exception as e:
-            print(f"Waiting for structural connection on port {COM_PORT} ... ({e})")
+            # If the outgoing port is locked or shifting, wait gracefully
+            print(f"Attempting hook-in on discovered port {target_port} ... ({e})")
             time.sleep(3)
             continue
         
-        print(f"Connection established successfully on {COM_PORT}")
+        print(f"Connection established successfully on automated target: {target_port}")
         push_launchers(ser)
         last_push, last_launch = 0, time.time()
         
@@ -252,7 +277,7 @@ def run():
                     push_launchers(ser)
                     last_launch = now
         except Exception as e:
-            print("Serial link disconnected, starting loop re-entry...", e)
+            print("Serial link disconnected, restarting auto-discovery scan...", e)
             try:
                 ser.close()
             except Exception:
