@@ -6,30 +6,17 @@
 
   CONTROLS
     up / down     move the highlight
-    left          back (up one level)          <- replaces the old Back row
+    left          back (up one level)
     right         open / enter / fire
     press         select; on a value (volume, brightness, seek) press to
                   START editing, joystick changes it, press again to finish
-    while editing a volume row, up/down toggles mute
+                  while editing a volume row, up/down toggles mute
 
   FIRST-TIME WiFi
     On first boot (no saved networks) the device starts a hotspot
     "DeskDeck-Setup" (password below). Join it from a phone and open
     192.168.4.1 to add your home network. After that it auto-connects and
     the web page is reachable at the LAN IP shown in Settings > WiFi setup.
-
-  BUILD NOTES
-    - Board: an ESP32 with Bluetooth Classic (not S2/C3).
-    - Partition scheme: one WITH OTA (e.g. "Default 4MB with spiffs").
-    - Libraries: Adafruit GFX + Adafruit SH110X (others are core).
-    - BT + WiFi together are RAM-heavy. If you hit instability, the clean
-      fix is to drop Bluetooth and move the PC link to WiFi/TCP.
-
-  PROTOCOL (over Bluetooth SPP, newline-terminated)
-    PC -> ESP32:  V|name,vol,muted;...   S|cpu=..;ram=..;gpu=..;temp=..;net=..   L|a;b;c
-    ESP32 -> PC:  SET i v | MUTE i | PWR <a> | MEDIA <a> | LAUNCH i |
-                  VLC playpause|seek 10|seek -10|subtitle|audiotrack|fullscreen|pause
-    WiFi / power / brightness / re-pair etc. are local and not sent to the PC.
 */
 
 #include <Wire.h>
@@ -59,8 +46,8 @@
 Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ---------- Joystick ----------
-#define JOY_X_PIN   34
-#define JOY_Y_PIN   35
+#define JOY_X_PIN    34
+#define JOY_Y_PIN    35
 #define JOY_BTN_PIN 32
 const bool INVERT_X = false, INVERT_Y = false;
 
@@ -184,7 +171,7 @@ void setup() {
   analogReadResolution(12);
   delay(250);
   if (!display.begin(i2c_Address, true)) { Serial.println(F("OLED not found")); for(;;); }
-  Wire.setClock(400000);            // 400 kHz I2C -> ~4x faster screen refresh (try 800000 if stable)
+  Wire.setClock(400000);            // 400 kHz I2C -> ~4x faster screen refresh
   display.setTextWrap(false);
   display.setRotation(rot ? 2 : 0);
   applyBrightness();
@@ -375,7 +362,11 @@ void resolveConfirm() {
 void adjustH(int dir) {
   buildRows(); Row& r = rowList[selByPage[page]];
   if (r.kind==K_VAL) { int i=r.i; sessions[i].vol = constrain(sessions[i].vol+dir*VOL_STEP,0,100); send(String("SET ")+i+" "+sessions[i].vol); }
-  else if (r.kind==K_LVL) { brightness = constrain(brightness+dir*BRI_STEP,5,100); applyBrightness(); }
+  else if (r.kind==K_LVL) { 
+    brightness = constrain(brightness+dir*BRI_STEP,5,100); 
+    applyBrightness(); 
+    send(String("BRI ") + brightness); // Updated to target modern PC display structures over serial pipeline
+  }
   else if (r.kind==K_SCRUB) { send(String("VLC seek ")+(dir>0?"10":"-10")); toast(dir>0?"+10s":"-10s"); }
 }
 void editV() {
