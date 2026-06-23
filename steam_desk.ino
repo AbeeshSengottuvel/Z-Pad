@@ -184,6 +184,7 @@ void setup() {
   analogReadResolution(12);
   delay(250);
   if (!display.begin(i2c_Address, true)) { Serial.println(F("OLED not found")); for(;;); }
+  Wire.setClock(400000);            // 400 kHz I2C -> ~4x faster screen refresh (try 800000 if stable)
   display.setTextWrap(false);
   display.setRotation(rot ? 2 : 0);
   applyBrightness();
@@ -201,8 +202,7 @@ void loop() {
     server.handleClient();
     ArduinoOTA.handle();
     pollScan();
-    if (millis() > nextWifiCheck) { nextWifiCheck = millis() + 4000;
-      if (WiFi.status() != WL_CONNECTED) wifiMulti.run(); updateWebIP(); }
+    if (millis() > nextWifiCheck) { nextWifiCheck = millis() + 4000; updateWebIP(); }
   }
   if (connecting && (WiFi.status() == WL_CONNECTED || millis() > connectUntil)) {
     connecting = false; updateWebIP();
@@ -213,7 +213,7 @@ void loop() {
   checkSleepTimer();
   if (!asleep && sleepOn && !booting && (millis() - lastInput > SLEEP_MS)) asleep = true;
   render();
-  delay(15);
+  delay(2);
 }
 
 // ==========================================================================
@@ -474,7 +474,7 @@ void updateWebIP() { if (WiFi.status()==WL_CONNECTED) { wifiUp=true; webIP=WiFi.
   else { wifiUp=false; webIP=WiFi.softAPIP().toString(); } }
 void wifiStart() {
   WiFi.mode(WIFI_AP_STA); WiFi.softAP(AP_SSID, AP_PASS);
-  applyMulti(); wifiMulti.run(8000);
+  applyMulti(); WiFi.setAutoReconnect(true); wifiMulti.run(4000);
   configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
   server.on("/", handleRoot); server.on("/save", HTTP_POST, handleSave); server.on("/forget", HTTP_POST, handleForget);
   server.begin();
