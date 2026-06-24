@@ -12,11 +12,21 @@
                   START editing, joystick changes it, press again to finish
                   while editing a volume row, up/down toggles mute
 
+  NOW PLAYING page (from Home > Now Playing, or VLC > Now Playing)
+    up / down     volume up / down (PC master volume)
+    left / right  seek backward / forward (10s)
+    press         play / pause
+    hold press    back to menu  (the one screen where left is NOT back)
+
   FIRST-TIME WiFi
     On first boot (no saved networks) the device starts a hotspot
     "DeskDeck-Setup" (password below). Join it from a phone and open
     192.168.4.1 to add your home network. After that it auto-connects and
     the web page is reachable at the LAN IP shown in Settings > WiFi setup.
+
+  PC HANDSHAKE
+    The companion app sends "PING" and the device replies "PONG" so the PC
+    can find the correct outgoing COM port and detect when the link drops.
 */
 
 #include <Wire.h>
@@ -30,6 +40,7 @@
 #include <WiFiMulti.h>
 #include <WiFiUdp.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <ArduinoOTA.h>
 #include <time.h>
@@ -57,6 +68,7 @@ const unsigned long NAV_DELAY_MS    = 350, NAV_RATE_MS = 150;
 const unsigned long EDIT_DELAY_MS   = 220, EDIT_RATE_MS = 70;
 const int           VOL_STEP        = 4, BRI_STEP = 5;
 const unsigned long BTN_DEBOUNCE_MS = 160;
+const unsigned long LONGPRESS_MS    = 500;   // hold-to-go-back on Now Playing
 const unsigned long SLEEP_MS        = 60000;
 
 // ---------- Identity / config ----------
@@ -74,6 +86,7 @@ BluetoothSerial SerialBT;
 WiFiMulti wifiMulti;
 WiFiUDP   udp;
 WebServer server(80);
+DNSServer dns;
 Preferences prefs;
 
 // ---------- Settings state ----------
@@ -88,7 +101,7 @@ struct Scan { char ssid[33]; int rssi; bool saved; };
 Scan scanList[12]; int scanCount = 0; int scanState = 0;   // 0 idle, 1 scanning
 bool wifiUp = false; String webIP = "off";
 bool connecting = false; unsigned long connectUntil = 0; String connectSSID = "";
-unsigned long nextWifiCheck = 0, nextClock = 0;
+unsigned long nextWifiCheck = 0, nextClock = 0, nextWifiRetry = 0;
 char clockStr[6] = "--:--";
 
 // ---------- PC data ----------
@@ -97,19 +110,23 @@ Session sessions[8]; int sessionCount = 0;
 struct Stats { int cpu, ram, gpu, temp; float net; bool valid; } stats = {0,0,0,0,0,false};
 char launchers[8][16]; int launcherCount = 0;
 
+// Now Playing (pushed by PC as  N|state;pos;len;title )
+struct NowPlaying { char title[48]; int pos; int len; uint8_t state; bool valid; } np = {"",0,0,0,false};
+// state: 0 = stopped, 1 = playing, 2 = paused
+
 // ---------- Menu data ----------
-enum { P_HOME, P_VLC, P_VOLUME, P_MEDIA, P_SYSTEM, P_LAUNCHER, P_SETTINGS, P_POWER, P_WIFI, P_CALIBRATE, P_ABOUT, P_N };
+enum { P_HOME, P_VLC, P_VOLUME, P_MEDIA, P_SYSTEM, P_LAUNCHER, P_SETTINGS, P_POWER, P_WIFI, P_CALIBRATE, P_ABOUT, P_NOWPLAYING, P_N };
 int page = P_HOME;
 int selByPage[P_N] = {0};
 
-const char* HOME_L[] = {"VLC","Volume mixer","Media","System","Launcher","Settings","Power","Calibrate"};
-const int   HOME_T[] = {P_VLC,P_VOLUME,P_MEDIA,P_SYSTEM,P_LAUNCHER,P_SETTINGS,P_POWER,P_CALIBRATE};
+const char* HOME_L[] = {"Now Playing","VLC","Volume mixer","Media","System","Launcher","Settings","Power"};
+const int   HOME_T[] = {P_NOWPLAYING,P_VLC,P_VOLUME,P_MEDIA,P_SYSTEM,P_LAUNCHER,P_SETTINGS,P_POWER};
 const int   HOME_N   = 8;
 const char* MEDIA_L[] = {"Play / Pause","Next track","Previous","Mute"};
 const char* MEDIA_C[] = {"playpause","next","prev","mute"};
 const char* POWER_L[] = {"Shutdown","Restart","Sleep","Lock","Log off"};
 const char* POWER_C[] = {"shutdown","restart","sleep","lock","logoff"};
-const char* STITLE[]  = {"Menu","VLC","Volume","Media","System","Apps","Settings","Power","WiFi","Calib","About"};
+const char* STITLE[]  = {"Menu","VLC","Volume","Media","System","Apps","Settings","Power","WiFi","Calib","About","Now Play"};
 
 // ---------- Modes / confirm / sleep timer ----------
 bool editing = false;
@@ -124,6 +141,7 @@ int centerX = 2048, centerY = 2048;
 // ---------- Input state ----------
 int prevVd = 0, prevHd = 0; unsigned long vNext = 0, hNext = 0;
 bool btnPrev = false; unsigned long btnLock = 0;
+unsigned long btnDownAt = 0; bool btnHandled = false;
 int lastX = 2048, lastY = 2048; unsigned long lastInput = 0;
 
 // ---------- Animation ----------
@@ -147,20 +165,20 @@ Row rowList[16]; int rowN = 0;
 
 // ---------- Prototypes ----------
 void send(const String&); void readBT(); void parseLine(String);
-void parseVolume(String); void parseStats(String); void parseLaunchers(String);
+void parseVolume(String); void parseStats(String); void parseLaunchers(String); void parseNP(String);
 void handleInput(); void fireV(int); void fireH(int); void onButton(); void rightPress();
 void navMove(int); void doRow(bool); void doToggle(String); void doAct(String,int);
 void wifiRowAction(Row&); void enterPage(int); void goHome(); void goBack(); int parentPage(int);
 bool isDisplay(int); int wrapi(int,int); void toast(const String&); String stLabel();
 void cfBegin(String,int,String); void resolveConfirm(); void adjustH(int); void editV();
 void cycleSleepTimer(); void checkSleepTimer(); void deepSleep(); void clearBonds();
-void applyBrightness(); void sendWOL(); void updateClock();
+void applyBrightness(); void sendWOL(); void updateClock(); String fmtTime(int);
 void loadNets(); void saveNets(); void addOrUpdateNet(String,String); void forgetNet(String);
 bool isSaved(String); String passFor(String); void applyMulti();
 void wifiStart(); void wifiStop(); void updateWebIP(); void startScan(); void pollScan(); int rssiBars(int);
 void buildRows();
-void render(); void drawStatusBar(); void invertRect(int,int,int,int);
-void drawList(); void drawSystem(); void drawCalibrate(); void drawAbout();
+void render(); void drawStatusBar(); void drawBtIcon(int); void invertRect(int,int,int,int);
+void drawList(); void drawSystem(); void drawCalibrate(); void drawAbout(); void drawNowPlaying();
 void drawConfirm(); void drawToast();
 void handleRoot(); void handleSave(); void handleForget(); String buildPage();
 
@@ -186,10 +204,15 @@ void loop() {
   if (booting && millis() > bootUntil) { booting = false; snapHL = true; goHome(); }
   if (btOn) readBT();
   if (wifiOn) {
+    dns.processNextRequest();            // captive portal redirect
     server.handleClient();
     ArduinoOTA.handle();
     pollScan();
     if (millis() > nextWifiCheck) { nextWifiCheck = millis() + 4000; updateWebIP(); }
+    if (WiFi.status() != WL_CONNECTED && savedCount > 0 && !connecting && millis() > nextWifiRetry) {
+      nextWifiRetry = millis() + 15000;          // slow retry; wifiMulti.run() blocks ~2s while scanning
+      wifiMulti.run();
+    }
   }
   if (connecting && (WiFi.status() == WL_CONNECTED || millis() > connectUntil)) {
     connecting = false; updateWebIP();
@@ -213,9 +236,11 @@ void readBT() {
     else if (c != '\r') { rxBuf += c; if (rxBuf.length() > 320) rxBuf = ""; } }
 }
 void parseLine(String line) {
+  if (line == "PING") { send("PONG"); return; }        // PC link handshake / keep-alive
   if (line.length() < 2 || line[1] != '|') return;
   char t = line[0]; String b = line.substring(2);
-  if (t=='V') parseVolume(b); else if (t=='S') parseStats(b); else if (t=='L') parseLaunchers(b);
+  if (t=='V') parseVolume(b); else if (t=='S') parseStats(b);
+  else if (t=='L') parseLaunchers(b); else if (t=='N') parseNP(b);
 }
 void parseVolume(String b) {
   sessionCount = 0; int s = 0;
@@ -245,6 +270,20 @@ void parseLaunchers(String b) {
     int sc = b.indexOf(';', s); String it = (sc==-1)?b.substring(s):b.substring(s,sc);
     it.toCharArray(launchers[launcherCount], 16); launcherCount++;
     if (sc==-1) break; s = sc+1; }
+}
+// N|state;pos;len;title    (title is the remainder so it may contain ';')
+void parseNP(String b) {
+  int c1 = b.indexOf(';');
+  int c2 = (c1<0)?-1:b.indexOf(';', c1+1);
+  int c3 = (c2<0)?-1:b.indexOf(';', c2+1);
+  if (c1<0 || c2<0 || c3<0) { np.valid = false; return; }
+  np.state = (uint8_t)b.substring(0, c1).toInt();
+  np.pos   = b.substring(c1+1, c2).toInt();
+  np.len   = b.substring(c2+1, c3).toInt();
+  String title = b.substring(c3+1);
+  title.trim();
+  title.toCharArray(np.title, sizeof(np.title));
+  np.valid = (np.state != 0) || (strlen(np.title) > 0);
 }
 
 // ==========================================================================
@@ -277,25 +316,46 @@ void handleInput() {
   prevVd = vd;
 
   if (hd != 0) {
-    bool rep = editing;
+    bool rep = editing || (page == P_NOWPLAYING);   // hold to scrub on Now Playing
     if (hd != prevHd) { fireH(hd); hNext = now + EDIT_DELAY_MS; }
     else if (rep && now >= hNext) { fireH(hd); hNext = now + EDIT_RATE_MS; }
   }
   prevHd = hd;
 
-  if (pressed && !btnPrev && now > btnLock) { btnLock = now + BTN_DEBOUNCE_MS; onButton(); }
+  if (page == P_NOWPLAYING) {
+    // short press = play/pause, hold = back (decided on release / threshold)
+    if (pressed && !btnPrev && now > btnLock) { btnDownAt = now; btnHandled = false; btnLock = now + BTN_DEBOUNCE_MS; }
+    if (pressed && !btnHandled && (now - btnDownAt >= LONGPRESS_MS)) {
+      btnHandled = true; toast("Menu"); goBack();
+    }
+    if (!pressed && btnPrev && !btnHandled) {
+      send("VLC playpause"); toast("Play / Pause"); btnHandled = true;
+    }
+  } else {
+    if (pressed && !btnPrev && now > btnLock) { btnLock = now + BTN_DEBOUNCE_MS; onButton(); }
+  }
   btnPrev = pressed;
 }
 
 void fireV(int vd) {
   if (cfActive) { confirmSel = 1 - confirmSel; return; }
   if (editing)  { editV(); return; }
+  if (page == P_NOWPLAYING) {                       // up/down = PC master volume
+    if (vd > 0) { send("VOL up");   toast("Volume +"); }
+    else        { send("VOL down"); toast("Volume -"); }
+    return;
+  }
   if (page == P_CALIBRATE) return;
   navMove(vd > 0 ? -1 : +1);     // up = move selection up
 }
 void fireH(int hd) {
   if (cfActive) { confirmSel = 1 - confirmSel; return; }
   if (editing)  { adjustH(hd); return; }
+  if (page == P_NOWPLAYING) {                        // left/right = seek -/+ 10s
+    send(String("VLC seek ") + (hd > 0 ? "10" : "-10"));
+    toast(hd > 0 ? "+10s" : "-10s");
+    return;
+  }
   if (page == P_CALIBRATE) return;
   if (hd > 0) rightPress(); else goBack();
 }
@@ -360,30 +420,31 @@ void resolveConfirm() {
   else if (cfType==CF_POWEROFF) { deepSleep(); }
 }
 void adjustH(int dir) {
-  buildRows(); Row& r = rowList[selByPage[page]];
+  buildRows(); if (rowN==0) { editing=false; return; } Row& r = rowList[selByPage[page]];
   if (r.kind==K_VAL) { int i=r.i; sessions[i].vol = constrain(sessions[i].vol+dir*VOL_STEP,0,100); send(String("SET ")+i+" "+sessions[i].vol); }
-  else if (r.kind==K_LVL) { 
-    brightness = constrain(brightness+dir*BRI_STEP,5,100); 
-    applyBrightness(); 
-    send(String("BRI ") + brightness); // Updated to target modern PC display structures over serial pipeline
+  else if (r.kind==K_LVL) {
+    brightness = constrain(brightness+dir*BRI_STEP,5,100);
+    applyBrightness();
+    send(String("BRI ") + brightness); // also drives PC monitor brightness via companion app
   }
   else if (r.kind==K_SCRUB) { send(String("VLC seek ")+(dir>0?"10":"-10")); toast(dir>0?"+10s":"-10s"); }
 }
 void editV() {
-  buildRows(); Row& r = rowList[selByPage[page]];
+  buildRows(); if (rowN==0) { editing=false; return; } Row& r = rowList[selByPage[page]];
   if (r.kind==K_VAL) { int i=r.i; sessions[i].muted=!sessions[i].muted; send(String("MUTE ")+i); toast(sessions[i].muted?"Muted":"Unmuted"); }
 }
 
 void enterPage(int p) { page=p; editing=false; cfActive=false; snapHL=true; slideX=14; selByPage[p]=0; if (p==P_WIFI) startScan(); }
 void goHome() { enterPage(P_HOME); }
 void goBack() { int p = parentPage(page); if (p>=0) { page=p; editing=false; cfActive=false; snapHL=true; slideX=14; } }
-int  parentPage(int p) { if (p==P_ABOUT || p==P_WIFI) return P_SETTINGS; if (p==P_HOME) return -1; return P_HOME; }
+int  parentPage(int p) { if (p==P_ABOUT || p==P_WIFI || p==P_CALIBRATE) return P_SETTINGS; if (p==P_HOME) return -1; return P_HOME; }
 bool isDisplay(int p) { return p==P_SYSTEM || p==P_CALIBRATE || p==P_ABOUT; }
 
 void toast(const String& m) { toastMsg = m; toastUntil = millis() + 1100; }
 void applyBrightness() { display.setContrast(map(brightness, 0, 100, 0, 255)); }
 String stLabel() { if (sleepTimerMin==0) return "Sleep timer: OFF";
   long rem = (long)(sleepTimerEnd - millis())/60000 + 1; return String("Sleep timer: ")+rem+"m"; }
+String fmtTime(int s) { if (s < 0) s = 0; int m = s/60, ss = s%60; char b[8]; snprintf(b, sizeof(b), "%d:%02d", m, ss); return String(b); }
 void cycleSleepTimer() {
   stIdx = (stIdx+1) % (int)(sizeof(ST_OPTS)/sizeof(ST_OPTS[0]));
   sleepTimerMin = ST_OPTS[stIdx];
@@ -455,7 +516,10 @@ void forgetNet(String ss) {
 int rssiBars(int r) { if (r>-60) return 3; if (r>-72) return 2; return 1; }
 void startScan() { scanCount=0; scanState=1; WiFi.scanNetworks(true, false); }
 void pollScan() {
-  if (scanState!=1) return; int n = WiFi.scanComplete(); if (n<0) return;
+  if (scanState!=1) return;
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return;            // -1: still scanning
+  if (n < 0) { scanState = 0; return; }          // -2 failed: stop, don't hang on "scanning..."
   scanCount=0; for (int i=0;i<n && scanCount<12;i++) { String s=WiFi.SSID(i);
     s.toCharArray(scanList[scanCount].ssid,33); scanList[scanCount].rssi=WiFi.RSSI(i);
     scanList[scanCount].saved=isSaved(s); scanCount++; }
@@ -464,37 +528,62 @@ void pollScan() {
 void updateWebIP() { if (WiFi.status()==WL_CONNECTED) { wifiUp=true; webIP=WiFi.localIP().toString(); }
   else { wifiUp=false; webIP=WiFi.softAPIP().toString(); } }
 void wifiStart() {
-  WiFi.mode(WIFI_AP_STA); WiFi.softAP(AP_SSID, AP_PASS);
-  applyMulti(); WiFi.setAutoReconnect(true); wifiMulti.run(4000);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);            // fixed channel 1, up to 4 clients
+  delay(100);
+  dns.start(53, "*", WiFi.softAPIP());               // captive portal: every lookup -> us
+  applyMulti(); WiFi.setAutoReconnect(true);
+  if (savedCount > 0) wifiMulti.run(4000);
   configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
-  server.on("/", handleRoot); server.on("/save", HTTP_POST, handleSave); server.on("/forget", HTTP_POST, handleForget);
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/forget", HTTP_POST, handleForget);
+  server.onNotFound(handleRoot);                     // OS probe URLs -> setup page (pops the portal)
   server.begin();
   ArduinoOTA.setHostname(OTA_HOST); ArduinoOTA.setPassword(OTA_PASS); ArduinoOTA.begin();
   updateWebIP();
 }
-void wifiStop() { server.stop(); WiFi.softAPdisconnect(true); WiFi.disconnect(true); WiFi.mode(WIFI_OFF); wifiUp=false; webIP="off"; }
+void wifiStop() { dns.stop(); server.stop(); WiFi.softAPdisconnect(true); WiFi.disconnect(true); WiFi.mode(WIFI_OFF); wifiUp=false; webIP="off"; }
 
 String buildPage() {
-  int n = WiFi.scanNetworks();
-  String h = "<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>";
-  h += "<style>body{font-family:sans-serif;max-width:480px;margin:14px auto;padding:0 12px;color:#222}";
-  h += "h2{font-weight:500}.n{display:flex;align-items:center;gap:8px;border:1px solid #ddd;border-radius:8px;padding:9px;margin:6px 0}";
-  h += ".n b{flex:1}input{padding:6px;border:1px solid #ccc;border-radius:6px}button{padding:6px 12px;border:1px solid #bbb;border-radius:6px;background:#f5f5f5}</style></head><body>";
-  h += "<h2>DeskDeck WiFi setup</h2>";
-  if (WiFi.status()==WL_CONNECTED) h += "<p>Connected: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")</p>";
-  else h += "<p>Setup mode at " + WiFi.softAPIP().toString() + "</p>";
-  h += "<h3>Saved</h3>";
-  for (int i=0;i<savedCount;i++)
-    h += "<div class=n><b>"+savedNets[i].ssid+"</b><form method=POST action=/forget><input type=hidden name=ssid value='"+savedNets[i].ssid+"'><button>Forget</button></form></div>";
-  h += "<h3>Available</h3>";
-  for (int i=0;i<n;i++) { String s = WiFi.SSID(i);
-    h += "<div class=n><b>"+s+"</b><form method=POST action=/save><input type=hidden name=ssid value='"+s+"'><input name=pass type=password placeholder=password><button>Save</button></form></div>"; }
-  WiFi.scanDelete();
-  h += "<h3>Add manually</h3><form method=POST action=/save><input name=ssid placeholder=SSID> <input name=pass type=password placeholder=password> <button>Save</button></form>";
+  // Reuse the cached async scan instead of a blocking WiFi.scanNetworks() so the
+  // device UI does not freeze whenever the setup page is loaded.
+  if (scanState == 0 && scanCount == 0) startScan();
+  bool conn = (WiFi.status()==WL_CONNECTED);
+  String h = "<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>DeskDeck setup</title>";
+  h += "<style>body{font-family:system-ui,sans-serif;max-width:460px;margin:0 auto;padding:16px;color:#1b1b1f;background:#fafafa}";
+  h += "h1{font-size:20px;font-weight:600;margin:0 0 4px}h2{font-size:14px;color:#666;font-weight:600;margin:18px 0 6px;text-transform:uppercase;letter-spacing:.04em}";
+  h += ".s{padding:8px 10px;border-radius:8px;margin-bottom:6px;font-size:14px}.ok{background:#e6f5ec;color:#15703b}.ap{background:#fff4e0;color:#8a5a00}";
+  h += ".n{display:flex;align-items:center;gap:8px;background:#fff;border:1px solid #e3e3e6;border-radius:10px;padding:10px;margin:6px 0}";
+  h += ".n b{flex:1;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar{color:#888;font-size:13px}";
+  h += "input{padding:8px;border:1px solid #ccc;border-radius:8px;font-size:14px;min-width:0}input[name=pass]{flex:1}";
+  h += "button{padding:8px 14px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:14px;font-weight:500}";
+  h += "button.g{background:#eee;color:#444}form{display:flex;gap:6px;align-items:center;flex:1}</style></head><body>";
+  h += "<h1>DeskDeck WiFi</h1>";
+  if (conn) h += "<div class='s ok'>Connected to " + WiFi.SSID() + " &middot; " + WiFi.localIP().toString() + "</div>";
+  else      h += "<div class='s ap'>Setup mode &middot; pick your network below</div>";
+
+  if (savedCount>0) {
+    h += "<h2>Saved networks</h2>";
+    for (int i=0;i<savedCount;i++)
+      h += "<div class=n><b>"+savedNets[i].ssid+"</b><form method=POST action=/forget><input type=hidden name=ssid value=\""+savedNets[i].ssid+"\"><button class=g>Forget</button></form></div>";
+  }
+
+  h += "<h2>Available networks</h2>";
+  if (scanCount==0) h += "<p style='color:#888;font-size:14px'>Scanning&hellip; reload in a moment.</p>";
+  for (int i=0;i<scanCount;i++) { String s = scanList[i].ssid; int b=rssiBars(scanList[i].rssi);
+    String dots = (b>=3?"\xe2\x96\x82\xe2\x96\x84\xe2\x96\x86":b==2?"\xe2\x96\x82\xe2\x96\x84":"\xe2\x96\x82");
+    h += "<div class=n><b>"+s+"</b><span class=bar>"+dots+"</span>";
+    h += "<form method=POST action=/save><input type=hidden name=ssid value=\""+s+"\"><input name=pass type=password placeholder='password'><button>Connect</button></form></div>"; }
+
+  h += "<h2>Add manually</h2><div class=n><form method=POST action=/save><input name=ssid placeholder=SSID style=flex:1><input name=pass type=password placeholder=password><button>Save</button></form></div>";
   h += "</body></html>"; return h;
 }
 void handleRoot()   { server.send(200, "text/html", buildPage()); }
-void handleSave()   { String ss=server.arg("ssid"), pw=server.arg("pass"); if (ss.length()) addOrUpdateNet(ss,pw);
+void handleSave()   { String ss=server.arg("ssid"), pw=server.arg("pass");
+                      if (ss.length()) { addOrUpdateNet(ss, pw);
+                        WiFi.begin(ss.c_str(), pw.c_str());            // connect to the new network now
+                        connecting = true; connectSSID = ss; connectUntil = millis()+12000; }
                       server.sendHeader("Location","/"); server.send(303); }
 void handleForget() { String ss=server.arg("ssid"); if (ss.length()) forgetNet(ss);
                       server.sendHeader("Location","/"); server.send(303); }
@@ -510,6 +599,7 @@ void buildRows() {
   rowN = 0;
   if (page==P_HOME) { for (int i=0;i<HOME_N;i++) addR(HOME_L[i], K_GO, HOME_T[i], ""); }
   else if (page==P_VLC) {
+    addR("Now Playing", K_GO, P_NOWPLAYING, "");
     addR("Play / Pause", K_ACT, 0, "vlc_pp");
     addR(String("Subtitles: ")+(subOn?"ON":"OFF"), K_TG, 0, "sub");
     addR("Audio track", K_ACT, 0, "vlc_audio");
@@ -527,26 +617,36 @@ void buildRows() {
     for (int i=0;i<5;i++) addR(POWER_L[i], K_ACT, i, String("pwr:")+POWER_C[i]);
     addR("Wake PC", K_ACT, 0, "wol");
   } else if (page==P_SETTINGS) {
-    addR(String("WiFi: ")+(wifiOn?"ON":"OFF"), K_TG, 0, "wifi");
+    addR("WiFi", K_GO, P_WIFI, "");
     addR(String("Bluetooth: ")+(btOn?"ON":"OFF"), K_TG, 0, "bt");
     addR("Brightness", K_LVL, 0, ""); rowList[rowN-1].v=brightness;
     addR(String("Auto-sleep: ")+(sleepOn?"ON":"OFF"), K_TG, 0, "sleep");
     addR(String("Rotate 180: ")+(rot?"ON":"OFF"), K_TG, 0, "rot");
-    addR("WiFi setup", K_GO, P_WIFI, "");
+    addR("Calibrate joystick", K_GO, P_CALIBRATE, "");
     addR("Re-pair Bluetooth", K_ACT, 0, "repair");
     addR("Restart ESP32", K_ACT, 0, "restart");
     addR("Power off", K_ACT, 0, "poweroff");
     addR("About device", K_GO, P_ABOUT, "");
   } else if (page==P_WIFI) {
-    for (int i=0;i<scanCount && rowN<14;i++) {
-      addR(scanList[i].ssid, K_NET, i, "");
-      rowList[rowN-1].str = rssiBars(scanList[i].rssi);
-      rowList[rowN-1].saved = scanList[i].saved;
-      rowList[rowN-1].on = (WiFi.status()==WL_CONNECTED && WiFi.SSID()==String(scanList[i].ssid));
+    addR(String("WiFi: ")+(wifiOn?"ON":"OFF"), K_TG, 0, "wifi");
+    if (wifiOn) {
+      if (WiFi.status()==WL_CONNECTED) addR(String("Net: ")+WiFi.SSID(), K_WEB, 0, "");
+      addR(String("IP ")+webIP, K_WEB, 0, "");
+      for (int i=0;i<scanCount && rowN<14;i++) {
+        addR(scanList[i].ssid, K_NET, i, "");
+        rowList[rowN-1].str = rssiBars(scanList[i].rssi);
+        rowList[rowN-1].saved = scanList[i].saved;
+        rowList[rowN-1].on = (WiFi.status()==WL_CONNECTED && WiFi.SSID()==String(scanList[i].ssid));
+      }
+      if (scanState==1 && scanCount==0) addR("scanning...", K_WEB, 0, "");
+      addR("Setup in browser", K_WEB, 0, "");
     }
-    if (scanState==1 && scanCount==0) addR("scanning...", K_WEB, 0, "");
-    addR(String("Add/edit  ")+webIP, K_WEB, 0, "");
   }
+  // Guard: a fresh PC push (e.g. fewer volume sessions) can leave the saved
+  // selection past the end of the list. Clamp so action handlers that index
+  // rowList[selByPage[page]] never read out of bounds.  (Volume-page crash fix.)
+  if (selByPage[page] >= rowN) selByPage[page] = (rowN > 0) ? rowN - 1 : 0;
+  if (selByPage[page] < 0) selByPage[page] = 0;
 }
 
 // ==========================================================================
@@ -567,18 +667,36 @@ void render() {
     display.setTextSize(1); display.setCursor(40,44); display.print("starting"); display.display(); return;
   }
   drawStatusBar();
-  if      (page==P_CALIBRATE) drawCalibrate();
-  else if (page==P_SYSTEM)    drawSystem();
-  else if (page==P_ABOUT)     drawAbout();
-  else                        drawList();
+  if      (page==P_CALIBRATE)   drawCalibrate();
+  else if (page==P_SYSTEM)      drawSystem();
+  else if (page==P_ABOUT)       drawAbout();
+  else if (page==P_NOWPLAYING)  drawNowPlaying();
+  else                          drawList();
   if (cfActive) drawConfirm();
   if (millis() < toastUntil) drawToast();
   display.display();
 }
 
+// Bluetooth status glyph.  mode: 0 = off (slashed), 1 = on / ready (outline),
+// 2 = connected (filled). Drawn in the top-left of the status bar.
+void drawBtIcon(int mode) {
+  const int gx=1, w=3, h=9;
+  const int cx=gx+w, y0=0, yb=h, yq=2, y3=7, ym=4;
+  if (mode==2) {                                   // connected -> solid kites
+    display.fillTriangle(cx,y0, cx+w,yq, cx,ym, SH110X_WHITE);
+    display.fillTriangle(cx,yb, cx+w,y3, cx,ym, SH110X_WHITE);
+  }
+  display.drawLine(cx,y0,   cx,yb,    SH110X_WHITE);   // spine
+  display.drawLine(cx,y0,   cx+w,yq,  SH110X_WHITE);   // upper right
+  display.drawLine(cx+w,yq, cx-w,y3,  SH110X_WHITE);   // upper cross
+  display.drawLine(cx,yb,   cx+w,y3,  SH110X_WHITE);   // lower right
+  display.drawLine(cx+w,y3, cx-w,yq,  SH110X_WHITE);   // lower cross
+  if (mode==0) display.drawLine(gx-1,y0, gx+2*w+1,yb, SH110X_WHITE);  // off slash
+}
+
 void drawStatusBar() {
   display.setTextSize(1); display.setTextColor(SH110X_WHITE);
-  if (btOn) { display.setCursor(0,1); display.print("BT"); }
+  drawBtIcon(btOn ? (SerialBT.hasClient() ? 2 : 1) : 0);
   if (wifiOn) {
     int bars = (WiFi.status()==WL_CONNECTED) ? rssiBars(WiFi.RSSI()) : 0;
     for (int b=0;b<3;b++) { int bh=2+b*2, x=16+b*3;
@@ -647,6 +765,50 @@ void drawSystem() {
   }
   display.setCursor(0,34); display.print("\x11");
 }
+
+void drawNowPlaying() {
+  display.setTextColor(SH110X_WHITE); display.setTextSize(1);
+
+  if (!np.valid) {
+    display.setCursor(20,28); display.print("Nothing playing");
+    display.setCursor(8,50);  display.print("(VLC idle / no PC)");
+    return;
+  }
+
+  // --- title (marquee scroll if too wide) ---
+  int tw = (int)strlen(np.title) * 6;            // ~6px per char at size 1
+  if (tw <= SCREEN_WIDTH - 6) {
+    display.setCursor(4,14); display.print(np.title);
+  } else {
+    int total = tw + 24;                          // text + gap before repeat
+    int off = (millis()/100) % total;
+    display.setCursor(4 - off, 14);          display.print(np.title);
+    display.setCursor(4 - off + total, 14);  display.print(np.title);   // seamless wrap
+  }
+
+  // --- state word + control hint ---
+  display.setCursor(4,28);
+  display.print(np.state==1 ? "Playing" : np.state==2 ? "Paused" : "Stopped");
+  display.setCursor(78,28); display.print("hold=menu");
+
+  // --- progress bar with seek arrows ---
+  int bx=12, by=42, bw=SCREEN_WIDTH-24, bh=6;
+  display.drawRect(bx,by,bw,bh,SH110X_WHITE);
+  if (np.len > 0) {
+    int fw = (bw-2) * np.pos / np.len; fw = constrain(fw, 0, bw-2);
+    if (fw > 0) display.fillRect(bx+1, by+1, fw, bh-2, SH110X_WHITE);
+  }
+  display.setCursor(2,42);  display.print("\x11");      // left  = seek back
+  display.setCursor(122,42); display.print("\x10");     // right = seek fwd
+
+  // --- elapsed / total times ---
+  display.setCursor(6,53); display.print(fmtTime(np.pos));
+  String tot = fmtTime(np.len);
+  int16_t bxx,byy; uint16_t bbw,bbh;
+  display.getTextBounds(tot.c_str(),0,0,&bxx,&byy,&bbw,&bbh);
+  display.setCursor(SCREEN_WIDTH-bbw-6, 53); display.print(tot);
+}
+
 void drawCalibrate() {
   int dx=lastX-centerX, dy=lastY-centerY; bool ok = abs(dx)<220 && abs(dy)<220;
   int bx=4, by=12, bs=48;
@@ -662,7 +824,7 @@ void drawCalibrate() {
 }
 void drawAbout() {
   display.setTextColor(SH110X_WHITE); display.setTextSize(1);
-  display.setCursor(4,14); display.print("Desk Deck v1.0");
+  display.setCursor(4,14); display.print("Desk Deck v1.1");
   display.setCursor(4,26);
   if (wifiOn && WiFi.status()==WL_CONNECTED) { display.print("ip "); display.print(WiFi.localIP()); }
   else if (wifiOn) { display.print("setup "); display.print(WiFi.softAPIP()); }
