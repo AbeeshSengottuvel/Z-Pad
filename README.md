@@ -12,16 +12,14 @@
 
 ```
  ┌──────────────────────────────┐
- │ ᛒ  ▮▮▮              23:41     │   ← status bar: Bluetooth · WiFi · clock
- │ ──────────────────────────── │
- │  Interstellar.2014.2160p.mkv │   ← scrolling title
- │  Playing            hold=menu│
- │ ◄ ▮▮▮▮▮▮▮▮▮▮▮░░░░░░░░░░░░░░ ► │   ← progress + seek
- │  12:14                2:48:00│
+ │ BT ▮▮▮              23:41 │
+ ├──────────────────────────────┤
+ │ Interstellar.2014.2160p.mkv  │
+ │ Playing            hold=menu │
+ │ ◄▮▮▮▮▮▮░░░░░░░░░░░░░░ ► │
+ │ 12:14                2:48:00 │
  └──────────────────────────────┘
-        ▲                                 up / down  →  volume
-     ◄  ●  ►                              left / right → seek
-        ▼                                 press → play/pause · hold → back
+   ↑ / ↓  volume     ← / →  seek     tap  play/pause     hold  back
 ```
 
 </div>
